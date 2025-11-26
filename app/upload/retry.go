@@ -3,16 +3,29 @@ package upload
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 func (uc *UpCmd) retryFailedTags(ctx context.Context) (bool, error) {
+	if _, err := os.Stat("failed_tags.json"); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	if uc.NoUI {
+		return uc.retryFailedTagsAction(ctx)
+	}
+	return uc.retryFailedTagsUI(ctx)
+}
+
+func (uc *UpCmd) retryFailedTagsAction(ctx context.Context) (bool, error) {
 	f, err := os.Open("failed_tags.json")
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
 		return false, err
 	}
 	defer f.Close()
@@ -31,12 +44,6 @@ func (uc *UpCmd) retryFailedTags(ctx context.Context) (bool, error) {
 		_, err := uc.saveTags(ctx, ft.Tag, ft.IDs)
 		if err != nil {
 			uc.app.Log().Error("Failed to retry tag", "tag", ft.Tag.Value, "err", err)
-			// saveTags already adds to uc.failedTags if it fails, but here we are running in a special mode.
-			// saveTags appends to uc.failedTags on error. We should probably clear uc.failedTags before starting or handle it differently.
-			// Actually, saveTags appends to uc.failedTags. So if we just run saveTags, it will populate uc.failedTags with any *new* failures.
-			// But wait, saveTags appends to uc.failedTags. If we are retrying, we should probably rely on that mechanism?
-			// The issue is that saveTags appends. So if we iterate `failedTags` (local var) and call `saveTags`, `uc.failedTags` will get populated with failures.
-			// So we can just check `uc.failedTags` at the end.
 		}
 	}
 
@@ -62,6 +69,86 @@ func (uc *UpCmd) retryFailedTags(ctx context.Context) (bool, error) {
 			}
 			f.Close()
 		}
+	}
+
+	return true, nil
+}
+
+func (uc *UpCmd) retryFailedTagsUI(ctx context.Context) (bool, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	uiApp := tview.NewApplication()
+	ui := uc.newUI(ctx, uc.app)
+	pages := tview.NewPages()
+	uiApp.SetRoot(pages, true)
+	pages.AddPage("ui", ui.screen, true, true)
+
+	stopUI := func(err error) {
+		cancel(err)
+		if uiApp != nil {
+			uiApp.Stop()
+		}
+	}
+
+	// handle Ctrl+C and Ctrl+Q
+	uiApp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyCtrlQ, tcell.KeyCtrlC:
+			ui.restoreLogger(uc.app)
+			cancel(errors.New("interrupted: Ctrl+C or Ctrl+Q pressed"))
+		case tcell.KeyEnter:
+			// Only allow exit if done? Or always?
+			// runUI allows exit if uploadDone is true.
+			// We can use a flag.
+		}
+		return event
+	})
+
+	go func() {
+		_, err := uc.retryFailedTagsAction(ctx)
+		if err != nil {
+			stopUI(err)
+			return
+		}
+
+		// Show modal
+		uiApp.QueueUpdateDraw(func() {
+			messages := strings.Builder{}
+			// We might not have counts if we didn't use the file processor for tagging events
+			// But we can just show the "safe to exit" message.
+			
+			// Check for errors in failedTags
+			uc.failedTagsMu.Lock()
+			failedCount := len(uc.failedTags)
+			uc.failedTagsMu.Unlock()
+
+			if failedCount > 0 {
+				messages.WriteString(fmt.Sprintf("%d tags failed to apply. Check log for details.\n", failedCount))
+			} else {
+				messages.WriteString("All tags applied successfully.\n")
+			}
+
+			modal := newModal(messages.String())
+			pages.AddPage("modal", modal, true, false)
+			pages.ShowPage("modal")
+			
+			// Update input capture to allow exit on Enter
+			uiApp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				switch event.Key() {
+				case tcell.KeyCtrlQ, tcell.KeyCtrlC:
+					ui.restoreLogger(uc.app)
+					cancel(errors.New("interrupted"))
+				case tcell.KeyEnter:
+					stopUI(nil)
+				}
+				return event
+			})
+		})
+	}()
+
+	if err := uiApp.Run(); err != nil {
+		return false, err
 	}
 
 	return true, nil
