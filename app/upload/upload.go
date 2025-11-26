@@ -1,3 +1,4 @@
+
 package upload
 
 import (
@@ -23,6 +24,8 @@ import (
 	"github.com/simulot/immich-go/internal/groups/burst"
 	"github.com/simulot/immich-go/internal/groups/epsonfastfoto"
 	"github.com/simulot/immich-go/internal/groups/series"
+	"sync"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -49,6 +52,11 @@ func (m UpLoadMode) String() string {
 	default:
 		return "Unknown"
 	}
+}
+
+type FailedTag struct {
+	Tag assets.Tag `json:"tag"`
+	IDs []string   `json:"ids"`
 }
 
 type UpCmd struct {
@@ -78,6 +86,8 @@ type UpCmd struct {
 	finished          bool                                 // the finish task has been run
 	infoCollector     *filenames.InfoCollector             // Collects information about the files being processed
 	DeferTags         bool                                 // Defer tagging until metadata extraction is complete
+	failedTags        []FailedTag                          // List of tags that failed to apply
+	failedTagsMu      sync.Mutex                           // Mutex to protect failedTags
 }
 
 func (uc *UpCmd) RegisterFlags(flags *pflag.FlagSet) {
@@ -173,6 +183,15 @@ func (uc *UpCmd) Run(cmd *cobra.Command, adapter adapters.Reader) error {
 	uc.Groupers = append(uc.Groupers, series.Group)
 	uc.Filters = append(uc.Filters, uc.ManageBurst.GroupFilter(), uc.ManageRawJPG.GroupFilter(), uc.ManageHEICJPG.GroupFilter())
 	uc.infoCollector = filenames.NewInfoCollector(uc.tz, uc.app.GetSupportedMedia())
+
+	// Check for failed tags and retry if found
+	retried, err := uc.retryFailedTags(ctx)
+	if err != nil {
+		return err
+	}
+	if retried {
+		return nil
+	}
 
 	return uc.upload(ctx, adapter)
 }

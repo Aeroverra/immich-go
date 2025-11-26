@@ -2,8 +2,10 @@ package upload
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +52,9 @@ func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (as
 		r, err := uc.client.Immich.UpsertTags(ctx, []string{tag.Value})
 		if err != nil {
 			uc.app.Log().Error("failed to create tag", "err", err, "tag", tag.Name)
+			uc.failedTagsMu.Lock()
+			uc.failedTags = append(uc.failedTags, FailedTag{Tag: tag, IDs: ids})
+			uc.failedTagsMu.Unlock()
 			return tag, err
 		}
 		uc.app.Log().Info("created tag", "tag", tag.Value)
@@ -66,8 +71,14 @@ func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (as
 		_, err = uc.client.Immich.TagAssets(ctx, tag.ID, ids[i:end])
 		if err != nil {
 			uc.app.Log().Error("failed to add assets to tag", "err", err, "tag", tag.Value, "assets", len(ids[i:end]))
-			return tag, err
+			uc.failedTagsMu.Lock()
+			uc.failedTags = append(uc.failedTags, FailedTag{Tag: tag, IDs: ids[i:end]})
+			uc.failedTagsMu.Unlock()
+			continue
 		}
+	}
+	if len(uc.failedTags) > 0 {
+		return tag, nil // Return nil error to continue processing other tags, failures are recorded
 	}
 	uc.app.Log().Info("updated tag", "tag", tag.Value, "assets", total)
 	return tag, err
@@ -126,6 +137,23 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 		}
 		uc.app.Log().Info("Metadata extraction complete, applying tags...")
 		uc.tagsCache.Close()
+
+		uc.failedTagsMu.Lock()
+		if len(uc.failedTags) > 0 {
+			uc.app.Log().Warn(fmt.Sprintf("%d tags failed to apply, saving to failed_tags.json", len(uc.failedTags)))
+			f, err := os.Create("failed_tags.json")
+			if err != nil {
+				uc.app.Log().Error("Failed to create failed_tags.json", "err", err)
+			} else {
+				enc := json.NewEncoder(f)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(uc.failedTags); err != nil {
+					uc.app.Log().Error("Failed to write failed_tags.json", "err", err)
+				}
+				f.Close()
+			}
+		}
+		uc.failedTagsMu.Unlock()
 	}
 
 	// Resume immich background jobs if requested
