@@ -1,3 +1,4 @@
+
 package upload
 
 import (
@@ -23,6 +24,8 @@ import (
 	"github.com/simulot/immich-go/internal/groups/burst"
 	"github.com/simulot/immich-go/internal/groups/epsonfastfoto"
 	"github.com/simulot/immich-go/internal/groups/series"
+	"sync"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -49,6 +52,11 @@ func (m UpLoadMode) String() string {
 	default:
 		return "Unknown"
 	}
+}
+
+type FailedTag struct {
+	Tag assets.Tag `json:"tag"`
+	IDs []string   `json:"ids"`
 }
 
 type UpCmd struct {
@@ -78,6 +86,8 @@ type UpCmd struct {
 	finished          bool                                 // the finish task has been run
 	infoCollector     *filenames.InfoCollector             // Collects information about the files being processed
 	DeferTags         bool                                 // Defer tagging until metadata extraction is complete
+	failedTags        []FailedTag                          // List of tags that failed to apply
+	failedTagsMu      sync.Mutex                           // Mutex to protect failedTags
 }
 
 func (uc *UpCmd) RegisterFlags(flags *pflag.FlagSet) {
@@ -86,7 +96,7 @@ func (uc *UpCmd) RegisterFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&uc.Overwrite, "overwrite", false, "Always overwrite files on the server with local versions")
 	flags.StringSliceVar(&uc.Tags, "tag", nil, "Add tags to the imported assets. Can be specified multiple times. Hierarchy is supported using a / separator (e.g. 'tag1/subtag1')")
 	flags.BoolVar(&uc.SessionTag, "session-tag", false, "Tag uploaded photos with a tag \"{immich-go}/YYYY-MM-DD HH-MM-SS\"")
-	flags.BoolVar(&uc.DeferTags, "defer-tags", true, "Defer tagging until metadata extraction is complete")
+	flags.BoolVar(&uc.DeferTags, "defer-tags", false, "Defer tagging until metadata extraction is complete")
 
 	uc.StackOptions.RegisterFlags(flags)
 }
@@ -173,6 +183,15 @@ func (uc *UpCmd) Run(cmd *cobra.Command, adapter adapters.Reader) error {
 	uc.Groupers = append(uc.Groupers, series.Group)
 	uc.Filters = append(uc.Filters, uc.ManageBurst.GroupFilter(), uc.ManageRawJPG.GroupFilter(), uc.ManageHEICJPG.GroupFilter())
 	uc.infoCollector = filenames.NewInfoCollector(uc.tz, uc.app.GetSupportedMedia())
+
+	// Check for failed tags and retry if found
+	retried, err := uc.retryFailedTags(ctx)
+	if err != nil {
+		return err
+	}
+	if retried {
+		return nil
+	}
 
 	return uc.upload(ctx, adapter)
 }
